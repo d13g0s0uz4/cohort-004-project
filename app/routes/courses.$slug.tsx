@@ -1,5 +1,5 @@
-import { useEffect } from "react";
-import { Link, useSearchParams } from "react-router";
+import { useEffect, useState } from "react";
+import { Link, useSearchParams, useFetcher } from "react-router";
 import { toast } from "sonner";
 import type { Route } from "./+types/courses.$slug";
 import {
@@ -42,6 +42,8 @@ import { formatDuration, formatPrice } from "~/lib/utils";
 import { renderMarkdown } from "~/lib/markdown.server";
 import { resolveCountry } from "~/lib/country.server";
 import { calculatePppPrice, getCountryTierInfo } from "~/lib/ppp";
+import { getCourseRatingSummary, getUserReviewForCourse, upsertCourseReview } from "~/services/reviewService";
+import { StarRatingDisplay, StarRatingInput } from "~/components/star-rating";
 
 export function meta({ data: loaderData }: Route.MetaArgs) {
   const title = loaderData?.course?.title ?? "Course";
@@ -102,6 +104,9 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     : courseWithDetails.price;
   const tierInfo = getCountryTierInfo(country);
 
+  const ratingSummary = getCourseRatingSummary(course.id);
+  const userReview = currentUserId ? getUserReviewForCourse(currentUserId, course.id) : null;
+
   return {
     course: courseWithDetails,
     salesCopyHtml,
@@ -113,10 +118,31 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     currentUserId,
     pppPrice,
     tierInfo,
+    ratingSummary,
+    userReview: userReview ? { rating: userReview.rating } : null,
   };
 }
 
-// No action — enrollment is handled via the purchase confirmation page
+export async function action({ params, request }: Route.ActionArgs) {
+  const currentUserId = await getCurrentUserId(request);
+  if (!currentUserId) {
+    throw data("Not authenticated", { status: 401 });
+  }
+
+  const course = getCourseBySlug(params.slug);
+  if (!course) {
+    throw data("Course not found", { status: 404 });
+  }
+
+  const formData = await request.formData();
+  const rating = Number(formData.get("rating"));
+  if (!rating || rating < 1 || rating > 5) {
+    throw data("Invalid rating", { status: 400 });
+  }
+
+  upsertCourseReview(currentUserId, course.id, rating);
+  return { ok: true };
+}
 
 export function HydrateFallback() {
   return (
@@ -181,6 +207,8 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     currentUserId,
     pppPrice,
     tierInfo,
+    ratingSummary,
+    userReview,
   } = loaderData;
   const isInstructor = currentUserId === course.instructorId;
   const [searchParams, setSearchParams] = useSearchParams();
@@ -320,6 +348,10 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               {formatDuration(totalDuration, true, false, false)} total
             </span>
           )}
+          <StarRatingDisplay
+            average={ratingSummary.averageRating}
+            count={ratingSummary.reviewCount}
+          />
         </div>
       </div>
 
@@ -413,6 +445,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
                       Buy More Seats
                     </Button>
                   </Link>
+                  <RatingWidget courseSlug={course.slug} userReview={userReview} />
                 </>
               ) : (
                 enrollButton
@@ -584,6 +617,42 @@ function CourseContent({
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function RatingWidget({
+  courseSlug,
+  userReview,
+}: {
+  courseSlug: string;
+  userReview: { rating: number } | null;
+}) {
+  const fetcher = useFetcher();
+  const [pendingRating, setPendingRating] = useState<number | null>(null);
+
+  const submittedRating =
+    fetcher.formData ? Number(fetcher.formData.get("rating")) : null;
+  const displayRating = submittedRating ?? pendingRating ?? userReview?.rating ?? null;
+
+  function handleChange(rating: number) {
+    setPendingRating(rating);
+    fetcher.submit(
+      { rating: String(rating) },
+      { method: "post", action: `/courses/${courseSlug}` }
+    );
+  }
+
+  return (
+    <div className="border-t pt-4">
+      <p className="mb-2 text-sm font-medium">
+        {userReview ? "Your rating" : "Rate this course"}
+      </p>
+      <StarRatingInput
+        value={displayRating}
+        onChange={handleChange}
+        disabled={fetcher.state === "submitting"}
+      />
     </div>
   );
 }
