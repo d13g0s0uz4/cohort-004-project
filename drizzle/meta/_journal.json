@@ -29,6 +29,13 @@
       "when": 1748832000000,
       "tag": "0003_course_reviews",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1780371928158,
+      "tag": "0004_slow_maggott",
+      "breakpoints": true
     }
   ]
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Link, useFetcher, useNavigate } from "react-router";
 import { toast } from "sonner";
 import type { Route } from "./+types/courses.$slug.lessons.$lessonId";
@@ -26,9 +26,17 @@ import {
   getBestAttempt,
 } from "~/services/quizService";
 import { computeResult } from "~/services/quizScoringService";
+import {
+  getCommentsForLesson,
+  getCommentCount,
+  createComment,
+  deleteComment,
+  COMMENTS_PAGE_SIZE,
+} from "~/services/commentService";
 import { LessonProgressStatus } from "~/db/schema";
 import { Button } from "~/components/ui/button";
 import { Card, CardContent } from "~/components/ui/card";
+import { Textarea } from "~/components/ui/textarea";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -40,8 +48,10 @@ import {
   Github,
   HelpCircle,
   MapPin,
+  MessageSquare,
   PlayCircle,
   ShieldAlert,
+  Trash2,
   XCircle,
   Trophy,
   RotateCcw,
@@ -63,6 +73,16 @@ const lessonParamsSchema = z.object({
 
 const markCompleteSchema = z.object({
   intent: z.literal("mark-complete"),
+});
+
+const addCommentSchema = z.object({
+  intent: z.literal("add-comment"),
+  body: z.string().min(1).max(1000),
+});
+
+const deleteCommentSchema = z.object({
+  intent: z.literal("delete-comment"),
+  commentId: z.coerce.number().int().positive(),
 });
 
 export function meta({ data: loaderData }: Route.MetaArgs) {
@@ -248,11 +268,19 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     }
   }
 
+  const comments = enrolled && currentUserId
+    ? getCommentsForLesson(lessonId)
+    : [];
+  const commentCount = enrolled && currentUserId
+    ? getCommentCount(lessonId)
+    : 0;
+
   return {
     course: {
       id: courseWithDetails.id,
       title: courseWithDetails.title,
       slug: courseWithDetails.slug,
+      instructorId: course.instructorId,
     },
     curriculum: courseWithDetails.modules.map((m) => ({
       id: m.id,
@@ -281,6 +309,9 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     pppBlocked,
     pppBlockedCountry,
     pppPurchaseCountry,
+    comments,
+    commentCount,
+    hasMoreComments: COMMENTS_PAGE_SIZE < commentCount,
   };
 }
 
@@ -303,6 +334,36 @@ export async function action({ params, request }: Route.ActionArgs) {
   if (intent === "mark-complete") {
     markLessonComplete(currentUserId, lessonId);
     return { success: true };
+  }
+
+  if (intent === "add-comment") {
+    const enrolled = isUserEnrolled(currentUserId, course.id);
+    const isInstructor = course.instructorId === currentUserId;
+    if (!enrolled && !isInstructor) {
+      throw data("You must be enrolled to comment", { status: 403 });
+    }
+
+    const parsed = parseFormData(formData, addCommentSchema);
+    if (!parsed.success) {
+      return { commentErrors: parsed.errors };
+    }
+
+    createComment(currentUserId, lessonId, parsed.data.body);
+    return { commentSuccess: true };
+  }
+
+  if (intent === "delete-comment") {
+    const parsed = parseFormData(formData, deleteCommentSchema);
+    if (!parsed.success) {
+      throw data("Invalid parameters", { status: 400 });
+    }
+
+    const result = deleteComment(parsed.data.commentId, lessonId, currentUserId, course.instructorId);
+    if (!result) {
+      throw data("Not allowed", { status: 403 });
+    }
+
+    return { deleteSuccess: true };
   }
 
   if (intent === "submit-quiz") {
@@ -382,6 +443,9 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
     pppBlocked,
     pppBlockedCountry,
     pppPurchaseCountry,
+    comments,
+    commentCount,
+    hasMoreComments,
   } = loaderData;
   const [autoplay, toggleAutoplay] = useAutoplay();
   const fetcher = useFetcher({ key: `mark-complete-${lesson.id}` });
@@ -590,6 +654,18 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
                 </fetcher.Form>
               )}
             </div>
+          )}
+
+          {/* Comments */}
+          {enrolled && currentUserId && (
+            <LessonComments
+              lessonId={lesson.id}
+              currentUserId={currentUserId}
+              courseInstructorId={course.instructorId}
+              initialComments={comments}
+              initialCount={commentCount}
+              initialHasMore={hasMoreComments}
+            />
           )}
 
           {/* Prev/Next Navigation */}
@@ -1011,6 +1087,203 @@ function QuizSection({
         </quizFetcher.Form>
       </CardContent>
     </Card>
+  );
+}
+
+type Comment = {
+  id: number;
+  body: string;
+  createdAt: string;
+  userId: number;
+  userName: string;
+  userRole: string;
+  userAvatarUrl: string | null;
+};
+
+function formatRelativeTime(isoString: string): string {
+  const diff = Date.now() - new Date(isoString).getTime();
+  const seconds = Math.floor(diff / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (days > 7) {
+    return new Date(isoString).toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+  }
+  if (days > 0) return `${days}d ago`;
+  if (hours > 0) return `${hours}h ago`;
+  if (minutes > 0) return `${minutes}m ago`;
+  return "just now";
+}
+
+function LessonComments({
+  lessonId,
+  currentUserId,
+  courseInstructorId,
+  initialComments,
+  initialCount,
+  initialHasMore,
+}: {
+  lessonId: number;
+  currentUserId: number;
+  courseInstructorId: number;
+  initialComments: Comment[];
+  initialCount: number;
+  initialHasMore: boolean;
+}) {
+  const commentFetcher = useFetcher({ key: `add-comment-${lessonId}` });
+  const deleteFetcher = useFetcher();
+  const loadMoreFetcher = useFetcher();
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const [extraComments, setExtraComments] = useState<Comment[]>([]);
+  const [nextOffset, setNextOffset] = useState(COMMENTS_PAGE_SIZE);
+  const [hasMore, setHasMore] = useState(initialHasMore);
+
+  const isSubmitting = commentFetcher.state !== "idle";
+  const commentError =
+    commentFetcher.data && "commentErrors" in commentFetcher.data
+      ? (commentFetcher.data.commentErrors as Record<string, string>)?.body
+      : null;
+
+  // Clear textarea after successful submission (loader revalidates automatically)
+  useEffect(() => {
+    if (
+      commentFetcher.state === "idle" &&
+      commentFetcher.data &&
+      "commentSuccess" in commentFetcher.data
+    ) {
+      if (textareaRef.current) textareaRef.current.value = "";
+      setExtraComments([]);
+      setNextOffset(COMMENTS_PAGE_SIZE);
+    }
+  }, [commentFetcher.state, commentFetcher.data]);
+
+  useEffect(() => {
+    if (loadMoreFetcher.data) {
+      const result = loadMoreFetcher.data as {
+        comments: Comment[];
+        hasMore: boolean;
+        nextOffset: number;
+      };
+      setExtraComments((prev) => [...prev, ...result.comments]);
+      setHasMore(result.hasMore);
+      setNextOffset(result.nextOffset);
+    }
+  }, [loadMoreFetcher.data]);
+
+  const allComments = [...initialComments, ...extraComments];
+  const totalCount = initialCount;
+
+  return (
+    <div className="mb-8 border-t pt-8">
+      <div className="mb-6 flex items-center gap-2">
+        <MessageSquare className="size-5" />
+        <h2 className="text-xl font-semibold">
+          Discussion{totalCount > 0 ? ` (${totalCount})` : ""}
+        </h2>
+      </div>
+
+      {/* Comment form */}
+      <commentFetcher.Form method="post" className="mb-8">
+        <input type="hidden" name="intent" value="add-comment" />
+        <Textarea
+          ref={textareaRef}
+          name="body"
+          placeholder="Ask a question or leave a comment..."
+          className="mb-3 min-h-[80px] resize-none"
+          maxLength={1000}
+        />
+        {commentError && (
+          <p className="mb-2 text-sm text-destructive">{commentError}</p>
+        )}
+        <Button type="submit" size="sm" disabled={isSubmitting}>
+          {isSubmitting ? "Posting..." : "Post comment"}
+        </Button>
+      </commentFetcher.Form>
+
+      {/* Comment list */}
+      {allComments.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          No comments yet. Be the first to ask a question!
+        </p>
+      ) : (
+        <div className="space-y-4">
+          {allComments.map((comment) => {
+            const isOwn = comment.userId === currentUserId;
+            const isInstructor = comment.userId === courseInstructorId;
+            const canDelete = isOwn || currentUserId === courseInstructorId;
+
+            return (
+              <div key={comment.id} className="flex gap-3">
+                <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium uppercase">
+                  {comment.userName.charAt(0)}
+                </div>
+                <div className="flex-1">
+                  <div className="mb-1 flex items-center gap-2">
+                    <span className="text-sm font-medium">
+                      {comment.userName}
+                    </span>
+                    {isInstructor && (
+                      <span className="rounded-sm bg-primary/10 px-1.5 py-0.5 text-xs font-medium text-primary">
+                        Instructor
+                      </span>
+                    )}
+                    <span className="text-xs text-muted-foreground">
+                      {formatRelativeTime(comment.createdAt)}
+                    </span>
+                    {canDelete && (
+                      <deleteFetcher.Form method="post" className="ml-auto">
+                        <input
+                          type="hidden"
+                          name="intent"
+                          value="delete-comment"
+                        />
+                        <input
+                          type="hidden"
+                          name="commentId"
+                          value={comment.id}
+                        />
+                        <button
+                          type="submit"
+                          className="text-muted-foreground hover:text-destructive"
+                          aria-label="Delete comment"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </deleteFetcher.Form>
+                    )}
+                  </div>
+                  <p className="whitespace-pre-wrap text-sm">{comment.body}</p>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Load more */}
+      {hasMore && (
+        <div className="mt-6">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={loadMoreFetcher.state !== "idle"}
+            onClick={() =>
+              loadMoreFetcher.load(
+                `/api/lesson-comments?lessonId=${lessonId}&offset=${nextOffset}`
+              )
+            }
+          >
+            {loadMoreFetcher.state !== "idle" ? "Loading..." : "Load more comments"}
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 
